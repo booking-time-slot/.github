@@ -1,4 +1,4 @@
-name: Multi-Repo Orchestrator
+name: Multi-Repo Orchestrator v2
 
 on:
   workflow_dispatch:
@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: orchestrator-${{ github.event.inputs.deploy_env }}
@@ -40,14 +41,13 @@ jobs:
   manifest:
     name: Build release manifest
     runs-on: ubuntu-latest
-    outputs:
-      manifest_file: release-manifest.json
     steps:
       - name: Generate manifest
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.ORG_CI_TOKEN }}
         run: |
           set -euo pipefail
+          generated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           api_sha="$(gh api repos/${API_REPO}/commits/main --jq '.sha')"
           admin_sha="$(gh api repos/${ADMIN_REPO}/commits/main --jq '.sha')"
           client_sha="$(gh api repos/${CLIENT_REPO}/commits/main --jq '.sha')"
@@ -56,7 +56,12 @@ jobs:
 
           cat > release-manifest.json <<EOF
           {
-            "generated_at": "${{ github.run_id }}",
+            "generated_at": "${generated_at}",
+            "run_id": "${{ github.run_id }}",
+            "run_attempt": "${{ github.run_attempt }}",
+            "run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "actor": "${{ github.actor }}",
+            "trigger_ref": "${{ github.ref_name }}",
             "environment": "${{ github.event.inputs.deploy_env }}",
             "repositories": {
               "api": "${api_sha}",
@@ -130,6 +135,12 @@ jobs:
           if [ -f requirements.txt ]; then
             python -m pip install --upgrade pip
             pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            python -m pip install --upgrade pip
+            pip install .
+          else
+            echo "No dependency manifest found (requirements.txt/pyproject.toml)"
+            exit 1
           fi
           if [ -d tests ]; then
             pytest -q
@@ -142,6 +153,10 @@ jobs:
         run: |
           set -euo pipefail
           cd service
+          if [ ! -f package.json ]; then
+            echo "package.json not found"
+            exit 1
+          fi
           npm ci
           if npm run | grep -q " build"; then
             npm run build
@@ -149,7 +164,7 @@ jobs:
             echo "No build script, skipping"
           fi
           if npm run | grep -q " test"; then
-            npm test -- --runInBand || npm test || true
+            npm test -- --runInBand
           else
             echo "No test script, skipping"
           fi
@@ -161,7 +176,14 @@ jobs:
       - manifest
       - checks
     if: ${{ always() && github.event.inputs.run_deploy == 'true' && (needs.checks.result == 'success' || needs.checks.result == 'skipped') }}
+    environment:
+      name: ${{ github.event.inputs.deploy_env == 'production' && 'production' || 'stage' }}
     steps:
+      - name: Download manifest artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-manifest
+
       - name: Checkout devops repository
         uses: actions/checkout@v4
         with:
@@ -190,4 +212,13 @@ jobs:
           script: |
             set -euo pipefail
             cd /opt/booking-time-slot-devops || cd booking-time-slot-devops
+            mkdir -p release-manifests
+            cat > "release-manifests/release-${{ github.run_id }}.meta.json" <<EOF
+            {
+              "run_id": "${{ github.run_id }}",
+              "run_attempt": "${{ github.run_attempt }}",
+              "actor": "${{ github.actor }}",
+              "environment": "${{ github.event.inputs.deploy_env }}"
+            }
+            EOF
             sudo ./update.sh
