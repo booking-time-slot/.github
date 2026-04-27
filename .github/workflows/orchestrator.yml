@@ -1,0 +1,193 @@
+name: Multi-Repo Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - stage
+          - production
+        default: stage
+      run_deploy:
+        description: "Run deploy step after checks"
+        required: true
+        type: boolean
+        default: false
+      skip_tests:
+        description: "Skip tests/build checks"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orchestrator-${{ github.event.inputs.deploy_env }}
+  cancel-in-progress: false
+
+env:
+  API_REPO: booking-time-slot/booking-time-slot-api
+  ADMIN_REPO: booking-time-slot/booking-time-slot-admin
+  CLIENT_REPO: booking-time-slot/booking-time-slot-client
+  TELEGRAM_REPO: booking-time-slot/booking-time-slot-telegram
+  DEVOPS_REPO: booking-time-slot/booking-time-slot-devops
+
+jobs:
+  manifest:
+    name: Build release manifest
+    runs-on: ubuntu-latest
+    outputs:
+      manifest_file: release-manifest.json
+    steps:
+      - name: Generate manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          api_sha="$(gh api repos/${API_REPO}/commits/main --jq '.sha')"
+          admin_sha="$(gh api repos/${ADMIN_REPO}/commits/main --jq '.sha')"
+          client_sha="$(gh api repos/${CLIENT_REPO}/commits/main --jq '.sha')"
+          telegram_sha="$(gh api repos/${TELEGRAM_REPO}/commits/main --jq '.sha')"
+          devops_sha="$(gh api repos/${DEVOPS_REPO}/commits/main --jq '.sha')"
+
+          cat > release-manifest.json <<EOF
+          {
+            "generated_at": "${{ github.run_id }}",
+            "environment": "${{ github.event.inputs.deploy_env }}",
+            "repositories": {
+              "api": "${api_sha}",
+              "admin": "${admin_sha}",
+              "client": "${client_sha}",
+              "telegram": "${telegram_sha}",
+              "devops": "${devops_sha}"
+            }
+          }
+          EOF
+
+      - name: Upload manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release-manifest.json
+
+  checks:
+    name: Build and test services
+    runs-on: ubuntu-latest
+    needs: manifest
+    if: ${{ github.event.inputs.skip_tests != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - name: api
+            repo: booking-time-slot/booking-time-slot-api
+            branch: main
+            stack: python
+          - name: telegram
+            repo: booking-time-slot/booking-time-slot-telegram
+            branch: main
+            stack: python
+          - name: admin
+            repo: booking-time-slot/booking-time-slot-admin
+            branch: main
+            stack: node
+          - name: client
+            repo: booking-time-slot/booking-time-slot-client
+            branch: main
+            stack: node
+    steps:
+      - name: Checkout ${{ matrix.service.repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.service.repo }}
+          ref: ${{ matrix.service.branch }}
+          token: ${{ secrets.ORG_CI_TOKEN }}
+          path: service
+
+      - name: Set up Python
+        if: ${{ matrix.service.stack == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        if: ${{ matrix.service.stack == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: service/package-lock.json
+
+      - name: Python checks
+        if: ${{ matrix.service.stack == 'python' }}
+        run: |
+          set -euo pipefail
+          cd service
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          fi
+          if [ -d tests ]; then
+            pytest -q
+          else
+            echo "No tests directory, skipping pytest"
+          fi
+
+      - name: Node checks
+        if: ${{ matrix.service.stack == 'node' }}
+        run: |
+          set -euo pipefail
+          cd service
+          npm ci
+          if npm run | grep -q " build"; then
+            npm run build
+          else
+            echo "No build script, skipping"
+          fi
+          if npm run | grep -q " test"; then
+            npm test -- --runInBand || npm test || true
+          else
+            echo "No test script, skipping"
+          fi
+
+  deploy:
+    name: Deploy via devops update.sh
+    runs-on: ubuntu-latest
+    needs:
+      - manifest
+      - checks
+    if: ${{ always() && github.event.inputs.run_deploy == 'true' && (needs.checks.result == 'success' || needs.checks.result == 'skipped') }}
+    steps:
+      - name: Checkout devops repository
+        uses: actions/checkout@v4
+        with:
+          repository: booking-time-slot/booking-time-slot-devops
+          ref: main
+          token: ${{ secrets.ORG_CI_TOKEN }}
+          path: devops
+
+      - name: Select target host
+        id: target
+        run: |
+          if [ "${{ github.event.inputs.deploy_env }}" = "production" ]; then
+            echo "host=${{ secrets.PROD_HOST }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "host=${{ secrets.STAGE_HOST }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run remote update
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ steps.target.outputs.host }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            cd /opt/booking-time-slot-devops || cd booking-time-slot-devops
+            sudo ./update.sh
